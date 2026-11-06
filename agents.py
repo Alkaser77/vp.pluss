@@ -9,10 +9,10 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # ===== عدل هنا لما تشري VPS =====
-VPS_HOST = "YOUR_VPS_IP"  # <-- غيرها لـ IP الحقيقي
 VPS_TOKEN = "vps_libya_2026_8rT9yU2iO5p"  # لازم نفس اللي في app.py
 PORT = 5001
-DOMAIN = "yourdomain.com"  # <-- غيرها لدومينك لما تركب شهادة TLS
+VPS_HOST = os.getenv("VPS_HOST", "YOUR_VPS_IP")
+DOMAIN = os.getenv("DOMAIN", "").strip() or VPS_HOST  # لو فاضي في Render، يستعمل IP
 # =================================
 
 BUNDLES = {}
