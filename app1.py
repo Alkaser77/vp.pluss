@@ -1,0 +1,675 @@
+from flask import Flask, request, jsonify, Response, redirect, make_response
+from datetime import datetime, timedelta
+from supabase import create_client, Client
+import os, requests, random, string
+
+app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def _handle_all_errors(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        if request.path.startswith('/admin') or request.path.startswith('/api'):
+            return jsonify({'error': str(e), 'message': 'خطأ: '+str(e)}), e.code
+        return e
+    print('SERVER ERROR:', e)
+    if request.path.startswith('/admin') or request.path.startswith('/api') or request.path.startswith('/check'):
+        return jsonify({'error': str(e), 'message': 'خطأ في السيرفر: '+str(e)}), 500
+    raise e
+
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+ADMIN_KEY = os.environ.get('ADMIN_KEY', "123456")
+ALLOWED_KEYS = [ADMIN_KEY, "123456", "admin123"]
+ROOT_WALLET = os.getenv("ROOT_WALLET", "0x2d447f9d656594f6c65de039aebe7da32a968400")
+USDT = "0x55d398326f99059fF775485246999027B3196775"
+RPC = "https://bsc-dataseed.binance.org/"
+TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/Alkaser77/kodular-api/eef3886cd9975c4c44bf1af94807370c7ae6d1d3/files"
+FILES = ["File.npvt", "File.ssc", "File.nm", "File.hc", "File.ehi", "File.npvs", "File.v2box"]
+
+MADAR_PRICE = 10
+def madar_activate(user_id):
+    exp = datetime.now() + timedelta(days=30)
+    user = get_user(user_id)
+    if not user: user = {"user_id": user_id}
+    user["expires_at"] = exp.strftime("%Y-%m-%d %H:%M:%S")
+    user["status"] = "active"
+    save_user(user)
+    try:
+        supabase.table("subscriptions").upsert({"user_id": user_id, "expire_at": exp.isoformat(), "is_paid": True, "tx_hash": f"madar_{user_id}_{int(datetime.now().timestamp())}", "amount_paid": MADAR_PRICE}).execute()
+    except: pass
+    return True
+
+def amount_for(uid):
+    h = abs(hash(str(uid))) % 900 + 100
+    return round(1 + h/10000, 4)
+
+def check_payment(uid):
+    amt = amount_for(uid); target = int(amt * 10**18)
+    try:
+        latest = int(requests.post(RPC, json={"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}, timeout=10).json()["result"],16)
+        padded = "0x000000000000000000000000" + ROOT_WALLET[2:].lower()
+        logs = requests.post(RPC, json={"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":hex(latest-15000),"toBlock":"latest","address":USDT,"topics":[TOPIC,None,padded]}],"id":1}, timeout=15).json().get("result",[])
+        used = set()
+        try: used = {x["tx_hash"] for x in supabase.table("subscriptions").select("tx_hash").execute().data if x.get("tx_hash")}
+        except: pass
+        for log in logs:
+            if int(log["data"],16) >= target and log["transactionHash"] not in used:
+                return True, log["transactionHash"], amt
+        return False, "no", amt
+    except Exception as e: return False, str(e), amt
+
+def get_user(user_id):
+    try:
+        res = supabase.table("users").select("*").eq("user_id", user_id).execute()
+        return res.data[0] if res.data else None
+    except: return None
+
+def save_user(user):
+    try: supabase.table("users").upsert(user).execute()
+    except Exception as e: print("save error", e)
+
+def parse_expire(exp_str):
+    if not exp_str:
+        return None
+    try:
+        s = str(exp_str).strip()
+        s = s.replace('Z', '').replace('T', ' ')
+        s = s.split('.')[0]
+        s = s[:19]
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except:
+        return None
+
+def get_remaining_hours(user):
+    if not user or not user.get("expires_at"): return 0
+    if user.get("status")=="inactive": return 0
+    exp = parse_expire(user["expires_at"])
+    if not exp: return 0
+    return max(0, (exp - datetime.now()).total_seconds()/3600)
+
+def get_remaining_seconds(user): return int(get_remaining_hours(user)*3600)
+
+def format_hm(hours_float):
+    if hours_float <=0: return "0:00:00"
+    total_seconds = int(hours_float*3600)
+    h = total_seconds//3600; m = (total_seconds%3600)//60; s = total_seconds%60
+    if h>=24: d=h//24; rh=h%24; return f"{d} يوم {rh}:{m:02d}:{s:02d}"
+    return f"{h}:{m:02d}:{s:02d}"
+
+def get_active_subscription(user_id):
+    try:
+        res = supabase.table("subscriptions").select("*").eq("user_id", user_id).eq("is_paid", True).execute()
+        if not res.data: return None
+        best = None
+        for s in res.data:
+            exp = parse_expire(s.get("expire_at"))
+            if exp and exp > datetime.now():
+                if not best or exp > parse_expire(best.get("expire_at")):
+                    best = s
+        return best
+    except: return None
+
+def is_paid_user(user_id):
+    return get_active_subscription(user_id) is not None
+
+def restore_paid_user(user_id):
+    sub = get_active_subscription(user_id)
+    if not sub: return None
+    exp = parse_expire(sub.get("expire_at"))
+    if not exp: return None
+    user = {"user_id": user_id, "expires_at": exp.strftime("%Y-%m-%d %H:%M:%S"), "status": "active"}
+    save_user(user)
+    return user
+
+def get_paid_users_list():
+    try:
+        subs = supabase.table("subscriptions").select("*").eq("is_paid", True).order("expire_at", desc=True).limit(200).execute().data
+    except: return []
+    out = []
+    seen = {}
+    for s in subs:
+        uid = s.get("user_id")
+        if not uid: continue
+        exp = parse_expire(s.get("expire_at"))
+        if not exp: continue
+        if uid in seen: continue
+        seen[uid] = True
+        tx = s.get("tx_hash") or ""
+        is_madar = str(tx).startswith("madar_") or str(tx).startswith("manual_")
+        method = "مدار" if is_madar else "USDT"
+        card_code = ""
+        if is_madar:
+            try:
+                used = supabase.table("madar_cards_used").select("*").eq("user_id", uid).execute().data
+                if used: card_code = used[-1].get("card_code") or ""
+            except: pass
+        remaining_h = max(0, (exp - datetime.now()).total_seconds()/3600)
+        out.append({"user_id": uid,"method": method,"tx_hash": tx,"card_code": card_code or "","amount_paid": s.get("amount_paid") or 0,"expire_at": s.get("expire_at") or "","remaining": remaining_h,"remaining_formatted": format_hm(remaining_h),"is_active": remaining_h > 0,"created_at": s.get("created_at") or ""})
+    return out
+# ======== HTML ========
+HOME_HTML = """<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PREMIUM GATE</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><style>@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;900&display=swap');*{font-family:'Tajawal',sans-serif}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1)}.glow{box-shadow:0 0 40px rgba(139,92,246,0.3)}</style></head><body class="bg-[#050507] text-white min-h-screen"><div class="fixed inset-0 -z-10"><div class="absolute top-0 right-0 w-[600px] h-[600px] bg-purple-600/20 rounded-full blur-[120px]"></div><div class="absolute bottom-0 left-0 w-[600px] h-[600px] bg-emerald-500/15 rounded-full blur-[120px]"></div></div><div class="max-w-6xl mx-auto p-4 flex justify-between items-center"><div class="flex items-center gap-2"><div class="w-9 h-9 bg-white rounded-xl flex items-center justify-center text-black font-black">P</div><span class="font-black">PREMIUM GATE</span></div><div class="text-xs text-gray-500">0x2d44...8400 • SECURE</div></div><div class="max-w-6xl mx-auto px-4 mt-10 grid lg:grid-cols-2 gap-8 items-center"><div><div class="inline-flex items-center gap-2 glass rounded-full px-4 py-1.5 text-xs text-emerald-300 mb-4"><span class="w-2 h-2 bg-emerald-400 rounded-full animate-pulse"></span> النظام شغال - دخول فوري</div><h1 class="text-4xl lg:text-5xl font-black leading-[1.2]">دخولك للمحتوى<br><span class="bg-gradient-to-r from-violet-400 to-emerald-400 bg-clip-text text-transparent">في ثانية واحدة</span></h1><p class="text-gray-400 mt-4 text-sm">رابط واحد ينشألك حساب، يعطيك ساعتين مجانا، ويفتحلك صفحة العرض الاحترافية.</p><div class="mt-8 flex flex-col gap-3"><button onclick="checkAndGo()" class="w-full bg-white text-black py-4 rounded-2xl font-black text-center text-lg glow hover:scale-[1.02] transition">🚀 إنشاء حساب ودخول فوري</button></div><div class="grid grid-cols-3 gap-3 mt-8"><div class="glass rounded-2xl p-4 text-center"><p class="text-2xl font-black text-violet-400">2H</p><p class="text-[11px] text-gray-400">مجانا</p></div><div class="glass rounded-2xl p-4 text-center"><p class="text-2xl font-black text-emerald-400">1$</p><p class="text-[11px] text-gray-400">30 يوم</p></div><div class="glass rounded-2xl p-4 text-center"><p class="text-2xl font-black">∞</p><p class="text-[11px] text-gray-400">تحميل</p></div></div></div><div class="bg-[#12121f] rounded-[32px] p-2 border border-white/10 shadow-2xl"><div class="bg-black rounded-[24px] p-6"><div class="flex justify-between mb-6"><span class="text-xs text-gray-500">معاينة حسابك الحقيقي</span><span class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span></div><div class="bg-[#12121f] rounded-[20px] p-5 border border-white/5"><div class="flex items-center justify-end gap-2 mb-3"><span>👤</span><span id="previewUid" class="font-bold">--</span></div><p class="text-sm text-right">متبقي: <span id="previewTimer" class="font-bold text-emerald-400">--:--:--</span> : متبقي</p><p class="text-sm text-right">حالة: <span id="previewStatus">active</span> : حالة</p><div class="grid grid-cols-2 gap-3 mt-6"><button onclick="openRealContent()" class="bg-[#8b5cf6] py-3 rounded-xl text-center font-bold text-sm">📁 محتوى</button><button onclick="openRealPay()" class="bg-[#10b981] py-3 rounded-xl text-center font-bold text-sm text-black">💳 دفع</button></div></div></div></div></div><div class="max-w-6xl mx-auto px-4 mt-12 grid md:grid-cols-3 gap-4"><button onclick="checkAndGo()" class="glass rounded-[24px] p-6 hover:border-violet-500/50 hover:scale-[1.02] transition text-right w-full"><div class="w-12 h-12 bg-violet-500/20 rounded-xl flex items-center justify-center text-violet-300 mb-4"><i class="fa-solid fa-bolt"></i></div><h3 class="font-bold">وصول فوري</h3><p class="text-sm text-gray-400 mt-2">يضغط ويدخل طول لصفحته</p><span class="text-xs text-violet-400 mt-3 block">دخول الآن →</span></button><a href="/view/demo_user" class="glass rounded-[24px] p-6 hover:border-emerald-500/50 hover:scale-[1.02] transition text-right"><div class="w-12 h-12 bg-emerald-500/20 rounded-xl flex items-center justify-center text-emerald-300 mb-4"><i class="fa-solid fa-shield"></i></div><h3 class="font-bold">حماية متقدمة</h3><p class="text-sm text-gray-400 mt-2">شوف صفحة العرض</p><span class="text-xs text-emerald-400 mt-3 block">عرض تجريبي →</span></a><div onclick="openChat()" class="glass rounded-[24px] p-6 hover:border-yellow-500/50 hover:scale-[1.02] transition text-right cursor-pointer"><div class="w-12 h-12 bg-yellow-500/20 rounded-xl flex items-center justify-center text-yellow-300 mb-4"><i class="fa-solid fa-headset"></i></div><h3 class="font-bold">دعم 24/7</h3><p class="text-sm text-gray-400 mt-2">دردشة فورية داخل الموقع</p><span class="text-xs text-yellow-400 mt-3 block">افتح الدردشة →</span></div></div><div id="chatBtn" onclick="openChat()" class="fixed bottom-6 right-6 w-14 h-14 bg-white rounded-full flex items-center justify-center text-black shadow-2xl cursor-pointer z-50 glow"><i class="fa-solid fa-comments text-xl"></i></div><div id="chatBox" class="fixed bottom-24 right-4 w-[360px] max-w-[90vw] bg-[#12121f] border border-white/10 rounded-[20px] shadow-2xl z-50 hidden flex-col overflow-hidden"><div class="bg-[#1e1e35] p-4 flex justify-between items-center"><div><p class="font-bold text-sm">💬 الدعم الفوري</p><p class="text-[11px] text-green-400">● متصل الآن</p></div><button onclick="closeChat()" class="text-gray-400">✕</button></div><div id="chatMsgs" class="flex-1 p-4 space-y-3 overflow-y-auto max-h-[320px] text-sm"><div class="bg-white/5 p-3 rounded-xl text-xs text-gray-300">مرحبا! 👋 انا الدعم، كيف نساعدك؟</div></div><div class="p-3 bg-black/30 flex gap-2"><input id="chatInput" placeholder="اكتب رسالتك..." class="flex-1 bg-[#0a0a12] border border-white/10 rounded-xl px-3 py-2.5 text-sm outline-none"><button onclick="sendMsg()" class="bg-white text-black px-4 rounded-xl font-bold text-sm">ارسال</button></div></div><script>
+let SUPPORT_UID = localStorage.getItem('support_uid') || "guest_"+Math.floor(Math.random()*99999);localStorage.setItem('support_uid', SUPPORT_UID);let chatInterval = null;function goUid(){let v=document.getElementById('uidInput').value.trim(); if(!v){document.getElementById('uidInput').focus();return;} location.href='/view/'+v;}function openChat(){ document.getElementById('chatBox').classList.remove('hidden'); document.getElementById('chatBox').classList.add('flex'); loadMsgs(); if(chatInterval) clearInterval(chatInterval); chatInterval = setInterval(loadMsgs, 2000); }function closeChat(){ document.getElementById('chatBox').classList.add('hidden'); document.getElementById('chatBox').classList.remove('flex'); if(chatInterval) clearInterval(chatInterval); }async function loadMsgs(){ try{let r=await fetch('/api/support/get?user_id='+SUPPORT_UID).then(x=>x.json()); let box=document.getElementById('chatMsgs'); let h='<div class="bg-white/5 p-3 rounded-xl text-xs text-gray-300">مرحبا! 👋 انا الدعم، كيف نساعدك؟</div>'; r.forEach(m=>{if(m.sender==='user') h+='<div class="bg-white text-black p-3 rounded-2xl ml-10 rounded-br-sm">'+m.message+'</div>'; else h+='<div class="bg-[#1e1e35] p-3 rounded-2xl mr-10 rounded-bl-sm border border-white/10">'+m.message+'</div>';}); box.innerHTML=h; box.scrollTop=box.scrollHeight;}catch(e){}}async function sendMsg(){ let inp=document.getElementById('chatInput'); let txt=inp.value.trim(); if(!txt) return; await fetch('/api/support/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:SUPPORT_UID,message:txt,sender:'user'})}); inp.value=''; loadMsgs(); }function openRealContent(){ let id=localStorage.getItem('my_user_id'); if(id) location.href='/content/'+id; else alert('ما عندكش حساب، دير انشاء اول'); }function openRealPay(){ let id=localStorage.getItem('my_user_id'); if(id) location.href='/pay/'+id; else alert('ما عندكش حساب، دير انشاء اول'); }async function loadPreview(){let myId=localStorage.getItem('my_user_id');let uidEl=document.getElementById('previewUid');let timerEl=document.getElementById('previewTimer');let statusEl=document.getElementById('previewStatus');if(!myId){uidEl.innerText="ما عندكش حساب";timerEl.innerText="0:00:00";return;}uidEl.innerText=myId;try{let c=await fetch('/check?user_id='+myId).then(r=>r.json());statusEl.innerText=c.status;let rem=c.hours||"0:00:00";timerEl.innerText=rem;let parts=rem.split(':');let sec=0;if(parts.length>=2){if(parts.length===3) sec=parseInt(parts[0])*3600+parseInt(parts[1])*60+parseInt(parts[2]); else sec=parseInt(parts[0])*60+parseInt(parts[1]);}setInterval(function(){if(sec<=0) return; sec--; let h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60; timerEl.innerText=h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0');},1000);}catch(e){timerEl.innerText="خطأ";}}loadPreview();async function getFingerprint(){let s=navigator.userAgent+'|'+screen.width+'x'+screen.height+'|'+Intl.DateTimeFormat().resolvedOptions().timeZone+'|'+navigator.language;let hash=0; for(let i=0;i<s.length;i++){hash=((hash<<5)-hash)+s.charCodeAt(i); hash|=0;}return 'fp_'+Math.abs(hash);}async function checkAndGo(){let fp=await getFingerprint();localStorage.setItem('my_fp',fp);localStorage.removeItem('my_user_id');localStorage.removeItem('last_go_time');document.cookie="last_user_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";document.cookie="device_fp=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";location.href='/go?fp='+encodeURIComponent(fp);}</script></body></html>"""
+PAY_HTML = """<!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>دفع</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-[#0a0a12] min-h-screen flex items-center justify-center p-4"><div class="w-full max-w-md"><div class="bg-[#1e1e35] rounded-[24px] p-6 border border-white/10"><h1 class="text-xl font-bold text-white text-center">الدفع الآمن - USDT (BEP20)</h1><div class="bg-black/40 rounded-2xl p-4 mt-4"><div class="flex justify-between items-center gap-2"><div id="amt" class="text-2xl font-bold text-emerald-400">-- USDT</div><button onclick="copyAmt()" class="bg-white/10 hover:bg-white/20 text-white text-xs px-3 py-2 rounded-lg whitespace-nowrap">📋 نسخ المبلغ</button></div></div><div class="bg-black/40 rounded-2xl p-4 mt-4"><p class="text-xs text-gray-400">عنوان المحفظة</p><div class="flex gap-2 items-center mt-2"><div class="bg-[#0a0a12] p-3 rounded-xl font-mono text-[11px] break-all text-white flex-1">__WALLET__</div><button onclick="copyWallet()" class="bg-white/10 hover:bg-white/20 text-white text-xs px-3 py-2 rounded-lg whitespace-nowrap">📋 نسخ المحفظة</button></div></div><button onclick="verify()" id="btn" class="w-full bg-emerald-500 text-black py-4 rounded-xl font-bold mt-4">لقد دفعت، فعل حسابي</button><a href="/pay-madar/__UID__" class="block w-full bg-yellow-400 text-black py-4 rounded-xl font-bold mt-3 text-center">💳 دفع بالمدار - 10 دينار</a><div id="status" class="mt-4 text-center text-sm text-white"></div><div class="text-center mt-3"><a id="toContent" class="text-xs text-gray-400 underline">عرض المحتوى</a></div></div></div><script>let UID="__UID__"; let currentAmount=""; let currentWallet="__WALLET__";async function init(){ let r=await fetch('/amount/'+UID).then(x=>x.json()); currentAmount=r.amount; document.getElementById('amt').innerText=r.amount+' USDT'; document.getElementById('toContent').href='/content/'+UID; }function copyAmt(){ navigator.clipboard.writeText(currentAmount); }function copyWallet(){ navigator.clipboard.writeText(currentWallet); }async function verify(){let b=document.getElementById('btn'),s=document.getElementById('status');b.innerHTML="جاري التحقق...";b.disabled=true;try{let r=await fetch('/verify/'+UID).then(x=>x.json());if(r.paid){s.innerHTML="تم التفعيل";setTimeout(()=>location.href='/content/'+UID,1500);}else{s.innerHTML='لم يتم العثور';b.disabled=false;b.innerHTML="لقد دفعت، فعل حسابي";}}catch(e){s.innerText="خطأ";b.disabled=false;}}init();</script></body></html>"""
+MADAR_HTML = """<!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>دفع بالمدار</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-[#0a0a12] min-h-screen flex items-center justify-center p-4"><div class="w-full max-w-md"><div class="bg-[#1e1e35] rounded-[24px] p-6 border border-white/10 text-center"><h1 class="text-xl font-bold text-white">دفع بالمدار - 10 دينار</h1><p class="text-yellow-400 text-[11px] mt-4">سيتم مراجعته يدويا وتفعيل حسابك</p><input id="cardCode" type="text" inputmode="numeric" placeholder="رقم الكرت السري" class="w-full bg-black border border-white/20 rounded-xl px-4 py-4 text-center text-lg font-bold mt-4 outline-none text-white tracking-widest" maxlength="20"><button onclick="chargeCard()" id="btnPaid" class="w-full bg-yellow-400 text-black py-4 rounded-xl font-black mt-3">ارسال الكرت للمراجعة</button><p id="msg1" class="mt-3 text-sm"></p><div id="done" class="hidden mt-4 bg-emerald-500/20 border border-emerald-500/30 rounded-xl p-4"><p class="text-emerald-300 font-bold">تم ارسال الكرت ✅</p><p class="text-gray-400 text-xs mt-1">انتظر تفعيل حسابك من الادمن</p><a href="/view/__UID__" class="block mt-3 bg-white text-black py-2 rounded-xl font-bold text-sm">الرجوع لحسابي</a></div></div></div><script>
+let UID="__UID__";async function chargeCard(){let card=document.getElementById('cardCode').value.trim();if(card.length<10){document.getElementById('msg1').innerHTML='<span class="text-red-400">اكتب الرقم كامل</span>';return;}document.getElementById('msg1').innerHTML='جاري الارسال...';document.getElementById('btnPaid').disabled=true;let r=await fetch('/api/madar/charge-card',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:UID,card_code:card})}).then(x=>x.json());document.getElementById('btnPaid').disabled=false;if(r.status=='used'){document.getElementById('msg1').innerHTML='<span class="text-red-400">الكرت مستعمل قبل</span>';}else if(r.status=='pending'){document.getElementById('cardCode').classList.add('hidden');document.getElementById('btnPaid').classList.add('hidden');document.getElementById('msg1').classList.add('hidden');document.getElementById('done').classList.remove('hidden');}else{document.getElementById('msg1').innerHTML='<span class="text-red-400">خطأ، حاول مرة اخرى</span>';}}</script></body></html>"""
+CONTENT_HTML = """<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>مكتبتي | __UID__</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><style>@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap');*{font-family:'Tajawal',sans-serif}body{background:#06060b}.glass{background:rgba(255,255,255,.04);backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.08)}.card{transition:.25s}.card:hover{transform:translateY(-4px);border-color:rgba(139,92,246,.5);box-shadow:0 20px 40px rgba(0,0,0,.5)}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}.float{animation:float 4s ease-in-out infinite}.ring{stroke-dasharray:283;stroke-dashoffset:0;transition:stroke-dashoffset 1s linear;transform:rotate(-90deg);transform-origin:center}</style></head>
+<body class="text-white min-h-screen">
+<div class="fixed inset-0 -z-10 pointer-events-none"><div class="absolute top-[-100px] right-[-100px] w-[500px] h-[500px] bg-violet-600/20 rounded-full blur-[120px]"></div><div class="absolute bottom-[-100px] left-[-100px] w-[500px] h-[500px] bg-emerald-500/15 rounded-full blur-[120px]"></div><div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-blue-600/10 rounded-full blur-[140px]"></div></div>
+<div class="max-w-6xl mx-auto px-4 pt-4 flex items-center justify-between">
+<a href="/" class="flex items-center gap-2"><div class="w-9 h-9 bg-white rounded-xl flex items-center justify-center text-black font-black text-lg">P</div><span class="font-black tracking-wide">PREMIUM <span class="text-violet-400">GATE</span></span></a>
+<div class="flex items-center gap-2">
+<a href="/view/__UID__" class="bg-white/10 border border-white/10 px-4 py-2 rounded-full text-xs font-bold hover:bg-white/20">👤 حسابي</a>
+<a href="/" class="bg-white text-black px-4 py-2 rounded-full text-xs font-black">🏠 الرئيسية</a>
+</div>
+</div>
+<div class="max-w-6xl mx-auto px-4 mt-6">
+<div class="glass rounded-[28px] p-5 md:p-7 relative overflow-hidden">
+<div class="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-l from-transparent via-violet-400/60 to-transparent"></div>
+<div class="flex flex-col md:flex-row md:items-center gap-6 justify-between">
+<div class="flex-1">
+<div class="flex items-center gap-2 mb-3"><span class="bg-emerald-500/15 text-emerald-300 text-[11px] px-3 py-1 rounded-full font-bold">● مكتبتك مفتوحة</span><span id="planBadge" class="bg-violet-500/15 text-violet-300 text-[11px] px-3 py-1 rounded-full font-bold">⭐ PRO</span></div>
+<h1 class="text-[28px] md:text-[36px] font-black leading-[1.15]">مكتبتك الخاصة<br><span class="bg-gradient-to-l from-violet-400 via-fuchsia-400 to-emerald-400 bg-clip-text text-transparent">كل ملفاتك في مكان واحد</span></h1>
+<p class="text-gray-400 text-sm mt-3 leading-6">حمّل أي ملف بضغطة واحدة. ملفاتك محمية بحسابك ومربوطة بوقتك المتبقي.</p>
+<div class="flex flex-wrap gap-2 mt-5">
+<div class="bg-black/40 border border-white/10 rounded-2xl px-4 py-2.5 flex items-center gap-2"><i class="fa-solid fa-folder-open text-violet-400"></i><span class="text-xs text-gray-400">الملفات:</span><b id="totalFiles" class="text-sm">--</b></div>
+<div class="bg-black/40 border border-white/10 rounded-2xl px-4 py-2.5 flex items-center gap-2"><i class="fa-solid fa-user text-emerald-400"></i><span class="text-xs text-gray-400">ID:</span><b class="text-sm font-mono">__UID__</b></div>
+<div class="bg-black/40 border border-white/10 rounded-2xl px-4 py-2.5 flex items-center gap-2"><i class="fa-solid fa-shield-halved text-yellow-400"></i><span class="text-xs text-gray-400">حماية:</span><b class="text-sm text-emerald-300">نشطة</b></div>
+</div>
+</div>
+<div class="shrink-0 mx-auto md:mx-0">
+<div class="relative w-[140px] h-[140px]">
+<svg class="w-full h-full" viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="7"/><circle id="ringCircle" class="ring" cx="50" cy="50" r="45" fill="none" stroke="url(#grad)" stroke-width="7" stroke-linecap="round"/><defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#10b981"/></linearGradient></defs></svg>
+<div class="absolute inset-0 flex flex-col items-center justify-center"><span class="text-[10px] text-gray-400">متبقي</span><span id="time" class="text-[18px] font-black leading-none mt-1">--:--:--</span><span id="timeLabel" class="text-[10px] text-emerald-300 mt-1 font-bold">نشط</span></div>
+</div>
+<div class="flex gap-2 mt-3"><a href="/pay/__UID__" class="flex-1 bg-emerald-500 text-black text-center py-2.5 rounded-xl font-black text-xs">💳 تجديد</a><a href="/view/__UID__" class="flex-1 bg-white/10 border border-white/10 text-center py-2.5 rounded-xl font-bold text-xs">حسابي</a></div>
+</div>
+</div>
+<div class="mt-5"><div class="flex justify-between text-[11px] text-gray-400 mb-2"><span>نسبة الوقت المستهلك</span><span id="usedPercent">0%</span></div><div class="h-2 bg-white/10 rounded-full overflow-hidden"><div id="timeBar" class="h-full bg-gradient-to-l from-violet-500 to-emerald-500 rounded-full transition-all duration-700" style="width:0%"></div></div></div>
+</div>
+<div class="flex flex-col md:flex-row gap-3 mt-5">
+<div class="flex-1 relative"><i class="fa-solid fa-magnifying-glass absolute right-4 top-1/2 -translate-y-1/2 text-gray-500 text-sm"></i><input id="searchInput" oninput="filterFiles()" placeholder="دوّر على ملف... مثلا File.ehi" class="w-full bg-[#12121f] border border-white/10 rounded-2xl pr-11 pl-4 py-3.5 text-sm outline-none focus:border-violet-500 placeholder:text-gray-500"></div>
+<div class="flex gap-2 overflow-x-auto pb-1">
+<button onclick="setFilter('all',this)" data-filter="all" class="filterBtn shrink-0 bg-white text-black px-4 py-3 rounded-2xl text-xs font-black">الكل</button>
+<button onclick="setFilter('vpn',this)" data-filter="vpn" class="filterBtn shrink-0 bg-white/10 border border-white/10 px-4 py-3 rounded-2xl text-xs font-bold">VPN</button>
+<button onclick="setFilter('config',this)" data-filter="config" class="filterBtn shrink-0 bg-white/10 border border-white/10 px-4 py-3 rounded-2xl text-xs font-bold">Configs</button>
+<button onclick="setFilter('other',this)" data-filter="other" class="filterBtn shrink-0 bg-white/10 border border-white/10 px-4 py-3 rounded-2xl text-xs font-bold">أخرى</button>
+<button onclick="downloadAll()" class="shrink-0 bg-violet-600 px-4 py-3 rounded-2xl text-xs font-black">⬇ تحميل الكل</button>
+</div>
+</div>
+<div id="list" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-5 pb-6"></div>
+<div id="expiredBox" class="hidden glass rounded-[28px] p-8 text-center mt-5">
+<div class="w-16 h-16 mx-auto bg-red-500/15 rounded-2xl flex items-center justify-center text-2xl float">⏰</div>
+<h3 class="font-black text-lg mt-4">انتهى وقتك</h3>
+<p class="text-gray-400 text-sm mt-2">جدد اشتراكك باش ترجع تحمل ملفاتك من جديد.</p>
+<a href="/pay/__UID__" class="inline-block mt-5 bg-emerald-500 text-black px-8 py-3.5 rounded-2xl font-black">ادفع للتجديد - 30 يوم</a>
+</div>
+<div class="flex items-center justify-center gap-2 text-[11px] text-gray-500 pb-8"><span class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span> جميع الملفات محمية • التحميل مباشر وآمن • PREMIUM GATE</div>
+</div>
+<script>
+const UID="__UID__";
+let remainingSec=0; let allFiles=[]; let currentFilter='all'; let totalSecondsAtLoad=0;
+function fileMeta(name){
+  let ext=(name.split('.').pop()||'').toLowerCase();
+  let map={
+    'ehi':{icon:'🚀', bg:'bg-[#2f3f3f]', text:'text-white', label:'EHI', cat:'config', app:'HTTP Injector', border:'border-white/20', desc:''},
+    'hc':{icon:'HC', bg:'bg-orange-500', text:'text-white', label:'HC', cat:'vpn', app:'HTTP Custom', border:'border-orange-300', big:true, desc:''},
+    'ssc':{icon:'SSC', bg:'bg-[#6b21a8]', text:'text-yellow-300', label:'ssc', cat:'vpn', app:'SSH Custom', border:'border-purple-400', big:true, desc:''},
+    'nm':{icon:'M', bg:'bg-white', text:'text-red-500', label:'NM', cat:'config', app:'NetMod', border:'border-red-200', big:true, desc:''},
+    'npvt':{icon:'nV', bg:'bg-[#1d4ed8]', text:'text-white', label:'NPVT', cat:'vpn', app:'Npv Tunnel', border:'border-blue-400', big:true, desc:''},
+    'npvs':{icon:'nV', bg:'bg-[#1d4ed8]', text:'text-white', label:'NPVS', cat:'vpn', app:'Npv Tunnel', border:'border-blue-400', big:true, desc:''},
+    'v2box':{icon:'V2', bg:'bg-black', text:'text-white', label:'V2BOX', cat:'other', app:'V2Box', border:'border-white/30', big:true, desc:''}
+  };
+  return map[ext]||{icon:'📄', bg:'bg-white/10', text:'text-white', label:ext.toUpperCase(), cat:'other', app:name, desc:'ملف جاهز', border:'border-white/10'};
+}
+function formatHM(sec){ if(sec<=0) return "0:00:00"; let d=Math.floor(sec/86400); let h=Math.floor((sec%86400)/3600); let m=Math.floor((sec%3600)/60); let s=sec%60; if(d>0) return d+" يوم "+h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'); return h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'); }
+function tick(){ let el=document.getElementById('time'); if(remainingSec<=0){ el.innerText="0:00:00"; document.getElementById('timeLabel').innerText="منتهي"; return; } el.innerText=formatHM(remainingSec); let pct=0; if(totalSecondsAtLoad>0) pct=Math.min(100, Math.round(((totalSecondsAtLoad-remainingSec)/totalSecondsAtLoad)*100)); document.getElementById('usedPercent').innerText=pct+"% مستهلك"; document.getElementById('timeBar').style.width=pct+"%"; let ring=document.getElementById('ringCircle'); if(ring) ring.style.strokeDashoffset = 283 * (pct/100); remainingSec--; setTimeout(tick,1000); }
+function setFilter(f,btn){ currentFilter=f; document.querySelectorAll('.filterBtn').forEach(b=>{ b.className='filterBtn shrink-0 bg-white/10 border border-white/10 px-4 py-3 rounded-2xl text-xs font-bold'; }); if(btn) btn.className='filterBtn shrink-0 bg-white text-black px-4 py-3 rounded-2xl text-xs font-black'; renderFiles(); }
+function filterFiles(){ renderFiles(); }
+function renderFiles(){
+  let q=(document.getElementById('searchInput').value||'').toLowerCase().trim();
+  let filtered=allFiles.filter(f=>{ let m=fileMeta(f); if(currentFilter!='all' && m.cat!=currentFilter) return false; if(q && !f.toLowerCase().includes(q)) return false; return true; });
+  let list=document.getElementById('list');
+  if(filtered.length==0){ list.innerHTML='<div class="col-span-full glass rounded-[24px] p-10 text-center"><div class="text-3xl mb-3">🔍</div><p class="font-bold">مافيش ملف مطابق</p><p class="text-gray-400 text-sm mt-1">جرب كلمة تانية او غير الفلتر</p></div>'; return; }
+  let h=""; filtered.forEach(function(f,i){
+    let m=fileMeta(f); let num=String(i+1).padStart(2,'0');
+    h+='<div class="card glass rounded-[24px] p-5 relative overflow-hidden">'
+    +'<div class="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-l from-transparent via-white/20 to-transparent"></div>'
+    +'<div class="flex justify-between items-start"><div class="w-14 h-14 '+m.bg+' '+(m.border||'border-white/10')+' border-2 rounded-2xl flex items-center justify-center text-[22px] font-black '+m.text+'">'+m.icon+'</div><span class="text-[10px] bg-white/10 px-2.5 py-1 rounded-full font-mono text-gray-300">#'+num+'</span></div>'
+    +'<h3 class="font-black text-[17px] mt-4 truncate" dir="ltr" style="text-align:left">'+f+'</h3>'
+    +'<p class="text-xs font-bold '+m.text+' mt-1">'+m.app+'</p>'
+    +'<p class="text-xs text-gray-400 mt-1">'+m.desc+'</p>'
+    +'<div class="flex items-center gap-2 mt-3"><span class="text-[10px] '+m.bg+' '+m.text+' px-2.5 py-1 rounded-full font-bold">'+m.label+'</span><span class="text-[10px] bg-emerald-500/15 text-emerald-300 px-2.5 py-1 rounded-full font-bold">● جاهز</span><span class="text-[10px] text-gray-500">• تحميل مباشر</span></div>'
+    +'<a href="/download/'+f+'?user_id='+UID+'" class="mt-4 flex items-center justify-center gap-2 w-full bg-white text-black py-3 rounded-xl font-black text-sm hover:bg-violet-100 transition"><i class="fa-solid fa-download"></i> تحميل الآن</a>'
+    +'<button onclick="copyLink(\\''+f+'\\')" class="mt-2 w-full bg-white/5 border border-white/10 py-2.5 rounded-xl text-xs font-bold text-gray-300 hover:bg-white/10">📋 نسخ رابط التحميل</button>'
+    +'</div>';
+  });
+  list.innerHTML=h;
+}
+function copyLink(f){ let link=location.origin+'/download/'+f+'?user_id='+UID; navigator.clipboard.writeText(link); alert('تم نسخ رابط '+f); }
+function downloadAll(){ if(!allFiles.length) return; if(!confirm('تحميل كل الملفات ('+allFiles.length+') واحد ورا واحد؟')) return; allFiles.forEach(function(f,i){ setTimeout(()=>{ window.open('/download/'+f+'?user_id='+UID,'_blank'); }, i*600); }); }
+async function load(){
+  try{
+    let c=await fetch('/check?user_id='+UID).then(r=>r.json());
+    let parts=(c.hours||"0:00:00").split(':');
+    if(parts.length===3) remainingSec=parseInt(parts[0])*3600+parseInt(parts[1])*60+parseInt(parts[2]);
+    else if(parts.length===2) remainingSec=parseInt(parts[0])*60+parseInt(parts[1]);
+    else remainingSec=0;
+    if((c.hours||'').includes('يوم')){ let d=parseInt((c.hours||'').split(' يوم')[0])||0; remainingSec = d*86400 + remainingSec; }
+    totalSecondsAtLoad=remainingSec; tick();
+    let list=document.getElementById('list');
+    if(c.status!=='active'){ list.innerHTML=''; document.getElementById('expiredBox').classList.remove('hidden'); document.getElementById('time').innerText="0:00:00"; return; }
+    allFiles=c.files||[];
+    document.getElementById('totalFiles').innerText=allFiles.length+" ملف";
+    if(c.status==='active' && remainingSec>24*3600) document.getElementById('planBadge').innerText='⭐ PRO • مدفوع';
+    renderFiles();
+  }catch(e){ document.getElementById('list').innerHTML='<div class="col-span-full glass p-6 rounded-2xl text-center text-red-300">خطأ في التحميل، حدث الصفحة</div>'; }
+}
+load();
+</script></body></html>"""
+ADMIN_HTML = '''<!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin - يدوي</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"></head><body class="bg-[#050507] text-white min-h-screen p-3"><div class="max-w-7xl mx-auto">
+<div class="flex justify-between items-center mb-4"><h1 class="text-xl font-black">PROMAX V2 - يدوي</h1><div class="flex gap-2 items-center"><input id="search" placeholder="بحث user_id" class="bg-[#12121f] border border-white/10 rounded-xl px-3 py-1.5 text-xs w-32"><span id="keyStatus" class="text-[10px] px-3 py-1.5 rounded-full"></span></div></div>
+<div id="errorBox" class="hidden bg-red-900/30 border border-red-500/50 rounded-xl p-4 mb-4 text-sm"></div>
+<div class="grid grid-cols-5 gap-2 mb-4">
+<div class="bg-[#12121f] p-3 rounded-xl border border-white/5"><p class="text-[11px] text-gray-400">مجاني</p><p id="totalUsers" class="text-xl font-black">--</p></div>
+<div class="bg-[#12121f] p-3 rounded-xl border border-white/5"><p class="text-[11px] text-gray-400">نشط مجاني</p><p id="activeUsers" class="text-xl font-black text-emerald-400">--</p></div>
+<div class="bg-[#12121f] p-3 rounded-xl border border-white/5"><p class="text-[11px] text-gray-400">منتهي</p><p id="expiredUsers" class="text-xl font-black text-red-400">--</p></div>
+<div class="bg-[#12121f] p-3 rounded-xl border border-white/5"><p class="text-[11px] text-gray-400">مدفوع</p><p id="paidCount" class="text-xl font-black text-violet-400">--</p></div>
+<div class="bg-[#12121f] p-3 rounded-xl border border-white/5"><p class="text-[11px] text-gray-400">أجهزة</p><p id="deviceCount" class="text-xl font-black text-yellow-400">--</p></div>
+</div>
+<div class="flex gap-2 mb-4 text-xs overflow-x-auto">
+<button onclick="showTab('madar')" id="tab-madar" class="bg-yellow-400 text-black px-4 py-2 rounded-xl font-bold whitespace-nowrap">💳 كروت المدار <span id="madarBadge" class="hidden bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full"></span></button>
+<button onclick="showTab('usdt')" id="tab-usdt" class="bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap">💵 USDT <span id="usdtBadge" class="hidden bg-emerald-500 text-white text-[10px] px-2 py-0.5 rounded-full"></span></button>
+<button onclick="showTab('paid')" id="tab-paid" class="bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap">⭐ المشتركين</button>
+<button onclick="showTab('users')" id="tab-users" class="bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap">المستخدمين (مجاني)</button>
+<button onclick="showTab('support')" id="tab-support" class="bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap">الدعم <span id="supportBadge" class="hidden bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full"></span></button>
+<button onclick="showTab('devices')" id="tab-devices" class="bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap">الأجهزة</button>
+</div>
+<div id="view-madar" class="bg-[#12121f] rounded-2xl border border-white/5 p-3"><div class="flex justify-between items-center mb-3"><h2 class="font-bold text-sm">كروت المدار - يدوي - اشحن في تليفونك وبعدها فعل</h2><button onclick="loadMadar()" class="text-[11px] bg-white text-black px-3 py-1 rounded-lg font-bold">تحديث</button></div><div id="madarList" class="space-y-2 max-h-[75vh] overflow-y-auto"></div></div>
+<div id="view-usdt" class="hidden bg-[#12121f] rounded-2xl border border-white/5 p-3"><div class="flex justify-between items-center mb-3"><h2 class="font-bold text-sm">💵 مدفوعات USDT - تلقائي</h2><button onclick="loadUsdt()" class="text-[11px] bg-white text-black px-3 py-1 rounded-lg font-bold">تحديث</button></div><div class="flex gap-2 mb-3 text-[11px]"><button onclick="usdtFilter='all';loadUsdt()" class="bg-white text-black px-3 py-1 rounded-lg font-bold">الكل</button><button onclick="usdtFilter='active';loadUsdt()" class="bg-white/10 px-3 py-1 rounded-lg">نشط فقط</button></div><div id="usdtList" class="space-y-2 max-h-[75vh] overflow-y-auto"></div></div>
+<div id="view-paid" class="hidden bg-[#12121f] rounded-2xl border border-white/5 p-3"><div class="flex justify-between items-center mb-3"><h2 class="font-bold text-sm">⭐ المشتركين المدفوعين - مدار + USDT</h2><button onclick="loadPaid()" class="text-[11px] bg-white text-black px-3 py-1 rounded-lg font-bold">تحديث</button></div><div class="flex gap-2 mb-3 text-[11px]"><button onclick="paidFilter='all';loadPaid()" class="bg-white text-black px-3 py-1 rounded-lg font-bold">الكل</button><button onclick="paidFilter='مدار';loadPaid()" class="bg-yellow-400 text-black px-3 py-1 rounded-lg font-bold">مدار فقط</button><button onclick="paidFilter='USDT';loadPaid()" class="bg-emerald-400 text-black px-3 py-1 rounded-lg font-bold">USDT فقط</button></div><div id="paidList" class="space-y-2 max-h-[75vh] overflow-y-auto"></div></div>
+<div id="view-users" class="hidden bg-[#12121f] rounded-2xl border border-white/5 overflow-hidden"><div class="p-3 border-b border-white/5 flex justify-between items-center gap-2"><h2 class="font-bold text-sm">المستخدمين المجانيين فقط</h2><div class="flex gap-2"><input id="customDays" type="number" placeholder="أيام" class="w-16 bg-black border border-white/10 rounded-lg px-2 py-1 text-xs"><input id="customHours" type="number" placeholder="ساعات" class="w-16 bg-black border border-white/10 rounded-lg px-2 py-1 text-xs"></div><button onclick="loadUsers()" class="text-[11px] bg-white text-black px-3 py-1 rounded-lg font-bold">تحديث</button></div><div id="tb" class="divide-y divide-white/5 max-h-[75vh] overflow-y-auto text-sm"></div></div>
+<div id="view-support" class="hidden bg-[#12121f] rounded-2xl border border-white/5 p-3"><div id="convList" class="flex gap-2 overflow-x-auto mb-3"></div><div id="supportList" class="space-y-2 max-h-[70vh] overflow-y-auto"></div></div>
+<div id="view-devices" class="hidden bg-[#12121f] rounded-2xl border border-white/5 p-3"><div id="deviceList" class="space-y-2 max-h-[70vh] overflow-y-auto"></div><button onclick="clearDevices()" class="mt-3 w-full bg-red-500/20 text-red-300 py-2 rounded-xl text-xs">مسح كل الأجهزة</button></div>
+</div>
+<script>
+const KEY=new URLSearchParams(location.search).get("key");
+let allUsers=[]; let allSupport=[]; let currentFilter='all';
+let madarInterval=null; let usdtFilter='all'; let paidFilter='all';
+function showKeyStatus(){ let el=document.getElementById('keyStatus'); let err=document.getElementById('errorBox'); if(!KEY){ el.innerText='مافيش key'; el.className='text-[10px] bg-red-500/20 text-red-300 px-3 py-1.5 rounded-full'; err.classList.remove('hidden'); err.innerHTML='⚠️ لازم تفتح الرابط هكي:<br><b>/admin?key=123456</b>'; return false; } else { el.innerText='key: '+KEY; el.className='text-[10px] bg-emerald-500/20 text-emerald-300 px-3 py-1.5 rounded-full'; return true; }}
+function showTab(t){ ['madar','usdt','paid','users','support','devices'].forEach(x=>document.getElementById('view-'+x).classList.add('hidden')); ['madar','usdt','paid','users','support','devices'].forEach(x=>{ let b=document.getElementById('tab-'+x); if(b) b.className='bg-[#12121f] border border-white/10 px-4 py-2 rounded-xl whitespace-nowrap'; }); document.getElementById('view-'+t).classList.remove('hidden'); let active=document.getElementById('tab-'+t); if(t=='madar') active.className='bg-yellow-400 text-black px-4 py-2 rounded-xl font-bold whitespace-nowrap'; else if(t=='usdt') active.className='bg-emerald-400 text-black px-4 py-2 rounded-xl font-bold whitespace-nowrap'; else if(t=='paid') active.className='bg-violet-500 text-white px-4 py-2 rounded-xl font-bold whitespace-nowrap'; else active.className='bg-white text-black px-4 py-2 rounded-xl font-bold whitespace-nowrap'; if(madarInterval) clearInterval(madarInterval); if(t==='madar'){ loadMadar(); madarInterval=setInterval(loadMadar, 3000); } if(t==='usdt') loadUsdt(); if(t==='paid') loadPaid(); if(t==='support') loadSupport(); if(t==='devices') loadDevices(); if(t==='users') loadUsers(); }
+async function loadUsers(){ if(!showKeyStatus()) return; let tb=document.getElementById('tb'); tb.innerHTML='<div class="p-6 text-center text-gray-400">جاري التحميل...</div>'; try{ let res = await fetch('/admin/users?key='+KEY); let data = await res.json(); if(data.error){ tb.innerHTML='<div class="p-6 text-center text-red-400">❌ '+data.error+'</div>'; return; } allUsers=data; renderUsers(data); document.getElementById('totalUsers').innerText=data.length; document.getElementById('activeUsers').innerText=data.filter(x=>x.is_active).length; document.getElementById('expiredUsers').innerText=data.filter(x=>!x.is_active).length; }catch(e){ tb.innerHTML='<div class="p-4 text-red-300">فشل: '+e.message+'</div>'; }}
+function renderUsers(list){ let s=document.getElementById('search').value.trim(); if(s) list=list.filter(x=>x.user_id.includes(s)); let h=""; list.forEach(function(x){ let statusBadge = x.is_active ? '<span class="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full text-[10px]">مجاني فعال</span>' : '<span class="bg-red-500/20 text-red-300 px-2 py-0.5 rounded-full text-[10px]">منتهي/معطل</span>'; let timeColor = x.is_active ? 'text-emerald-400' : 'text-red-400'; h+='<div class="p-3 hover:bg-white/5 border-b border-white/5 last:border-0"><div class="flex justify-between items-start gap-2"><div class="flex-1"><div class="flex items-center gap-2"><p class="font-bold text-[13px]">'+x.user_id+'</p>'+statusBadge+'</div><p class="text-[11px] text-gray-500 mt-1">'+(x.ip_address||'')+'</p><p class="text-[12px] mt-1">متبقي مجاني: <span class="font-black '+timeColor+'">'+x.remaining_formatted+'</span></p><p class="text-[10px] text-gray-600 mt-1">ينتهي: '+x.expire_at+'</p></div><div class="flex flex-col gap-1 text-[11px] min-w-[140px]"><div class="flex gap-1"><button onclick="actionUser(\\''+x.user_id+'\\',\\'extend_custom\\')" class="flex-1 bg-violet-500 text-white px-2 py-1.5 rounded-lg font-bold">+ مخصص</button><button onclick="actionUser(\\''+x.user_id+'\\',\\'add_days\\',30)" class="bg-emerald-500 text-black px-2 py-1.5 rounded-lg font-bold">+30 يوم</button></div><div class="flex gap-1"><button onclick="actionUser(\\''+x.user_id+'\\',\\'enable\\')" class="flex-1 bg-white/10 px-2 py-1.5 rounded-lg">تفعيل</button><button onclick="actionUser(\\''+x.user_id+'\\',\\'disable\\')" class="flex-1 bg-yellow-500/10 text-yellow-300 px-2 py-1.5 rounded-lg">تعطيل</button><button onclick="actionUser(\\''+x.user_id+'\\',\\'delete\\')" class="bg-red-500/20 text-red-300 px-2 py-1.5 rounded-lg">حذف</button></div><a href="/view/'+x.user_id+'" target="_blank" class="text-center bg-white text-black py-1 rounded-lg font-bold text-[10px] mt-1">فتح صفحته</a></div></div></div>'; }); document.getElementById('tb').innerHTML=h||'<div class="p-6 text-center text-gray-500">لا يوجد مجانيين</div>'; }
+document.getElementById('search').addEventListener('input', function(){ renderUsers(allUsers); });
+async function actionUser(uid, act, val){ let days=0, hours=0; if(act==='extend_custom'){ days=parseInt(document.getElementById('customDays').value)||0; hours=parseInt(document.getElementById('customHours').value)||0; if(days===0 && hours===0){ alert('اكتب عدد الأيام او الساعات فوق'); return; }} if(act==='add_days'){ days=val; } if(!confirm(act+' ل '+uid+' ؟')) return; let r=await fetch('/admin/action?key='+KEY, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({user_id:uid, action:act, days:days, hours:hours})}).then(x=>x.json()); alert(r.message||'تم'); loadUsers(); }
+async function loadMadar(){ let list=document.getElementById('madarList'); list.innerHTML='<div class="p-6 text-center text-gray-400">جاري التحميل...</div>'; try{ let data=await fetch('/admin/madar-pending?key='+KEY).then(r=>r.json()); let badge=document.getElementById('madarBadge'); let pending=data.filter(x=>x.status=='pending'); if(pending.length>0){ badge.innerText=pending.length; badge.classList.remove('hidden'); } else { badge.classList.add('hidden'); } let h=""; data.forEach(function(x){ let color = x.status=='pending' ? 'border-yellow-500/30 bg-yellow-500/10' : x.status=='approved' ? 'border-emerald-500/30 bg-emerald-500/10' : 'border-red-500/30 bg-red-500/10'; h+='<div class="p-3 rounded-xl border '+color+'"><div class="flex justify-between"><div><p class="font-bold text-sm">'+(x.user_id||'')+'</p><p class="font-mono text-[13px] mt-1 tracking-widest">'+(x.card_code||'')+'</p><p class="text-[11px] text-gray-500 mt-1">'+(x.created_at||'')+' - '+(x.status||'')+'</p></div><div class="flex flex-col gap-1">'; if(x.status=='pending'){ h+='<button onclick="approveMadar('+x.id+',\\''+(x.user_id||'')+'\\',\\''+(x.card_code||'')+'\\')" class="bg-emerald-500 text-black px-3 py-1.5 rounded-lg font-bold text-xs">✅ تفعيل بعد الشحن</button>'; h+='<button onclick="rejectMadar('+x.id+')" class="bg-red-500/20 text-red-300 px-3 py-1.5 rounded-lg text-xs">❌ رفض</button>'; } h+='<a href="/view/'+(x.user_id||'')+'" target="_blank" class="text-center bg-white/10 px-3 py-1 rounded-lg text-[11px]">فتح حسابه</a></div></div></div>'; }); list.innerHTML=h||'<div class="p-6 text-center text-gray-400">لا يوجد كروت</div>'; }catch(e){ list.innerHTML='خطأ: '+e.message; } }
+async function approveMadar(id, uid, card){ if(!confirm('هل شحنت الكرت '+card+' ؟')) return; let r=await fetch('/admin/madar-approve?key='+KEY,{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:id, user_id:uid, card_code:card})}).then(x=>x.json()); alert(r.message||'تم'); loadMadar(); loadPaid(); loadUsers(); }
+async function rejectMadar(id){ if(!confirm('رفض الكرت؟')) return; await fetch('/admin/madar-reject?key='+KEY,{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:id})}); loadMadar(); }
+async function loadUsdt(){ let list=document.getElementById('usdtList'); list.innerHTML='<div class="p-6 text-center text-gray-400">جاري التحميل...</div>'; try{ let data=await fetch('/admin/usdt?key='+KEY).then(r=>r.json()); let badge=document.getElementById('usdtBadge'); if(data.length>0){ badge.innerText=data.length; badge.classList.remove('hidden'); } else { badge.classList.add('hidden'); } if(usdtFilter=='active') data=data.filter(x=>x.is_active); let h=""; data.forEach(function(x){ let tx=(x.tx_hash||''); h+='<div class="p-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10"><div class="flex justify-between"><div><p class="font-bold text-sm">'+(x.user_id||'')+' <span class="text-[10px] bg-emerald-500 text-black px-2 py-0.5 rounded-full">USDT</span></p><p class="font-mono text-[11px] mt-1 break-all">'+tx+'</p><p class="text-[11px] text-gray-400 mt-1">المبلغ: '+(x.amount_paid||'')+' USDT</p><p class="text-[11px] text-gray-500">متبقي: '+(x.remaining_formatted||'')+'</p></div><div class="flex flex-col gap-1"><a href="/view/'+(x.user_id||'')+'" target="_blank" class="text-center bg-white text-black px-3 py-1.5 rounded-lg text-[11px] font-bold">فتح حسابه</a><button onclick="deletePaid(\\''+(x.user_id||'')+'\\')" class="bg-red-500/20 text-red-300 px-3 py-1.5 rounded-lg text-[11px]">حذف</button></div></div></div>'; }); list.innerHTML=h||'<div class="p-6 text-center text-gray-400">لا يوجد دفعات USDT</div>'; }catch(e){ list.innerHTML='خطأ: '+e.message; } }
+async function loadPaid(){ let list=document.getElementById('paidList'); list.innerHTML='<div class="p-6 text-center text-gray-400">جاري التحميل...</div>'; try{ let _resp=await fetch('/admin/paid?key='+KEY); let _txt=await _resp.text(); let data; try{ data=JSON.parse(_txt); }catch{ list.innerHTML='خطأ من السيرفر: '+_txt.slice(0,200); return; } if(!Array.isArray(data)){ list.innerHTML='خطأ: '+(data.error||data.message||_txt.slice(0,200)); return; } document.getElementById('paidCount').innerText=data.length; if(paidFilter!='all') data=data.filter(x=>x.method==paidFilter); let h=""; data.forEach(function(x){ let isMadar=x.method=='مدار'; let color=isMadar?'border-yellow-500/30 bg-yellow-500/10':'border-emerald-500/30 bg-emerald-500/10'; let badge=isMadar?'<span class="text-[10px] bg-yellow-400 text-black px-2 py-0.5 rounded-full font-bold">مدار</span>':'<span class="text-[10px] bg-emerald-400 text-black px-2 py-0.5 rounded-full font-bold">USDT</span>'; let tx=(x.tx_hash||''); let card=(x.card_code||''); let extra=isMadar?'كرت: '+card:'Tx: '+(tx?tx.slice(0,20)+'...':'بدون Tx'); h+='<div class="p-3 rounded-xl border '+color+'"><div class="flex justify-between"><div><p class="font-bold text-sm">'+(x.user_id||'')+' '+badge+'</p><p class="font-mono text-[11px] mt-1 break-all">'+extra+'</p><p class="text-[11px] text-gray-400 mt-1">متبقي: '+(x.remaining_formatted||'')+' - ينتهي: '+(x.expire_at||'')+'</p></div><div class="flex flex-col gap-1"><a href="/view/'+(x.user_id||'')+'" target="_blank" class="text-center bg-white text-black px-3 py-1.5 rounded-lg text-[11px] font-bold">فتح حسابه</a><button onclick="extendPaid(\\''+(x.user_id||'')+'\\')" class="bg-violet-500 text-white px-3 py-1.5 rounded-lg text-[11px] font-bold">+30 يوم</button><button onclick="deletePaid(\\''+(x.user_id||'')+'\\')" class="bg-red-500/20 text-red-300 px-3 py-1.5 rounded-lg text-[11px]">حذف نهائي</button></div></div></div>'; }); list.innerHTML=h||'<div class="p-6 text-center text-gray-400">لا يوجد مشتركين</div>'; }catch(e){ list.innerHTML='خطأ: '+e.message; } }
+async function extendPaid(uid){ if(!confirm('تمديد 30 يوم ل '+uid+' ؟')) return; try{ let res=await fetch('/admin/paid-extend?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid})}); let text=await res.text(); let r; try{ r=JSON.parse(text); }catch{ alert('السيرفر رد: '+text.slice(0,200)); return; } alert(r.message||'تم'); loadPaid(); }catch(e){ alert('خطأ: '+e.message); } }
+async function deletePaid(uid){ if(!confirm('حذف اشتراك '+uid+' نهائيا؟')) return; let r=await fetch('/admin/paid-delete?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid})}).then(x=>x.json()); alert(r.message||'تم'); loadPaid(); loadUsdt(); loadUsers(); }
+function filterChat(uid){ currentFilter=uid; renderSupportList(); }
+function renderSupportList(){ let filtered=currentFilter==='all'?allSupport:allSupport.filter(m=>m.user_id===currentFilter); let h=""; filtered.forEach(function(m){ h+='<div class="bg-black/30 p-3 rounded-xl"><p class="text-[11px] text-gray-500">'+m.user_id+' - '+(m.created_at||'')+'</p><p class="text-sm mt-1">'+(m.message||'')+'</p><div class="flex gap-2 mt-2"><input id="reply-'+m.id+'" placeholder="رد..." class="flex-1 bg-[#0a0a12] border border-white/10 rounded-lg px-2 py-1 text-xs"><button onclick="replySupport(\\''+m.user_id+'\\','+m.id+')" class="bg-white text-black px-3 py-1 rounded-lg text-xs font-bold">رد</button></div></div>'; }); document.getElementById('supportList').innerHTML=h||'لا رسائل'; let groups={}; allSupport.forEach(m=>{ if(!groups[m.user_id]) groups[m.user_id]=[]; groups[m.user_id].push(m); }); let convHtml='<button onclick="filterChat(\\'all\\')" class="'+(currentFilter==='all'?'bg-white text-black':'bg-white/10')+' px-3 py-2 rounded-xl text-xs">الكل</button>'; Object.keys(groups).forEach(function(uid){ convHtml+='<button onclick="filterChat(\\''+uid+'\\')" class="'+(currentFilter===uid?'bg-white text-black':'bg-white/10')+' px-3 py-2 rounded-xl text-xs">'+uid+'</button>'; }); document.getElementById('convList').innerHTML=convHtml;}
+async function loadSupport(){ let data=await fetch('/admin/support?key='+KEY).then(r=>r.json()); allSupport=data; renderSupportList(); }
+async function replySupport(uid, id){ let txt=document.getElementById('reply-'+id).value.trim(); if(!txt) return; await fetch('/api/support/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid, message:txt, sender:'admin'})}); alert('تم الرد'); loadSupport(); }
+async function loadDevices(){ let d=await fetch('/admin/devices?key='+KEY).then(r=>r.json()); document.getElementById('deviceCount').innerText=Array.isArray(d)?d.length:0; let h=""; if(Array.isArray(d)) d.forEach(function(x){ h+='<div class="flex justify-between items-center bg-black/20 p-2 rounded-xl"><div><p class="text-xs font-bold">'+x.fingerprint+'</p><p class="text-[11px] text-gray-500">'+x.user_id+' - '+(x.ip_address||'')+'</p></div><button onclick="delDevice(\\''+x.fingerprint+'\\')" class="bg-red-500/20 text-red-300 px-2 py-1 rounded-lg text-[11px]">حذف</button></div>'; }); document.getElementById('deviceList').innerHTML=h||'فارغ'; }
+async function delDevice(fp){ await fetch('/admin/devices/delete?key='+KEY, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fingerprint:fp})}); loadDevices(); }
+async function clearDevices(){ if(!confirm('مسح كل الأجهزة؟')) return; await fetch('/admin/devices/clear?key='+KEY, {method:'POST'}); loadDevices(); }
+let supportInterval=null; let lastSupportCount=0;
+function startLiveChat(){ if(supportInterval) clearInterval(supportInterval); supportInterval=setInterval(async ()=>{ try{ let data=await fetch('/admin/support?key='+KEY).then(r=>r.json()); if(Array.isArray(data) && data.length!==lastSupportCount){ allSupport=data; lastSupportCount=data.length; if(!document.getElementById('view-support').classList.contains('hidden')){ renderSupportList(); } let groups={}; data.forEach(function(m){ if(!groups[m.user_id]) groups[m.user_id]=[]; groups[m.user_id].push(m); }); let totalUnread=0; Object.keys(groups).forEach(function(uid){ let msgs=groups[uid].sort(function(a,b){ return new Date(a.created_at)-new Date(b.created_at); }); let last=msgs[msgs.length-1]; if(last && last.sender==='user'){ totalUnread++; }}); let badge=document.getElementById('supportBadge'); if(totalUnread>0){ badge.innerText=totalUnread; badge.classList.remove('hidden'); } else { badge.classList.add('hidden'); }}}catch(e){}}, 2000);}
+showKeyStatus(); loadMadar(); loadUsers(); loadPaid(); startLiveChat(); madarInterval=setInterval(loadMadar, 3000);
+</script></body></html>'''
+
+# ======== ROUTES - الرئيسية ========
+@app.route('/')
+def home(): return Response(HOME_HTML, mimetype='text/html')
+
+@app.route('/go')
+def go():
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    fp = request.args.get('fp','').strip() or request.cookies.get('device_fp','').strip()
+    if fp and fp.startswith('fp_'):
+        try:
+            res = supabase.table("device_limits").select("*").eq("fingerprint", fp).execute()
+            if res.data:
+                row = res.data[0]
+                created = parse_expire(row.get("created_at",""))
+                if created and (datetime.now() - created).total_seconds() / 3600 < 24:
+                    return redirect(f"/view/{row['user_id']}")
+        except: pass
+    uid = 'user_' + ''.join(random.choices(string.digits, k=6))
+    exp = datetime.now() + timedelta(hours=2)
+    user = {"user_id": uid, "expires_at": exp.strftime("%Y-%m-%d %H:%M:%S"), "status": "active", "ip_address": ip}
+    save_user(user)
+    if fp and fp.startswith('fp_'):
+        try: supabase.table("device_limits").upsert({"fingerprint": fp, "user_id": uid, "ip_address": ip, "created_at": datetime.now().isoformat()}, on_conflict="fingerprint").execute()
+        except:
+            try: supabase.table("device_limits").insert({"fingerprint": fp, "user_id": uid, "ip_address": ip}).execute()
+            except Exception as e: print("device insert fail", e)
+    resp = redirect(f"/view/{uid}")
+    if fp: resp.set_cookie('device_fp', fp, max_age=86400*30, samesite='Lax')
+    resp.set_cookie('last_user_id', uid, max_age=86400, samesite='Lax')
+    return resp
+
+@app.route('/clear')
+def clear():
+    resp = make_response("<script>localStorage.clear(); alert('تم المسح'); window.location='/';</script>")
+    resp.set_cookie('device_fp', '', expires=0)
+    resp.set_cookie('last_user_id', '', expires=0)
+    return resp
+
+@app.route('/view/<user_id>')
+def view_user(user_id):
+    u = get_user(user_id)
+    if not u:
+        restored = restore_paid_user(user_id)
+        if restored: u = restored
+        else:
+            exp = datetime.now() + timedelta(hours=2)
+            u = {"user_id": user_id, "expires_at": exp.strftime("%Y-%m-%d %H:%M:%S"), "status": "active"}
+            save_user(u)
+    else:
+        sub = get_active_subscription(user_id)
+        if sub:
+            exp = parse_expire(sub.get("expire_at"))
+            if exp and exp > datetime.now():
+                if parse_expire(u.get("expires_at")) != exp:
+                    u["expires_at"] = exp.strftime("%Y-%m-%d %H:%M:%S"); u["status"] = "active"; save_user(u)
+    remaining_sec = get_remaining_seconds(u)
+    rem_initial = format_hm(get_remaining_hours(u)) if u.get("status")!="inactive" else "معطل"
+    status = u.get("status", "active")
+    return Response(render_view(user_id, remaining_sec, rem_initial, status), mimetype='text/html')
+
+@app.route('/pay/<user_id>')
+def pay_page(user_id): return Response(PAY_HTML.replace("__WALLET__", ROOT_WALLET).replace("__UID__", user_id), mimetype='text/html')
+@app.route('/content/<user_id>')
+def content_page(user_id): return Response(CONTENT_HTML.replace("__UID__", user_id), mimetype='text/html')
+@app.route('/pay-madar/<user_id>')
+def pay_madar_page(user_id): return Response(MADAR_HTML.replace("__UID__", user_id), mimetype='text/html')
+@app.route('/amount/<user_id>')
+def amount_api(user_id): return jsonify({"amount": amount_for(user_id), "wallet": ROOT_WALLET})
+
+@app.route('/api/support/send', methods=['POST'])
+def support_send():
+    data = request.get_json(silent=True) or {}
+    try:
+        supabase.table("support_messages").insert({"user_id": data.get("user_id","guest"),"message": data.get("message"),"sender": data.get("sender","user")}).execute()
+    except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok":True})
+
+@app.route('/api/support/get')
+def support_get():
+    uid = request.args.get("user_id","guest")
+    try:
+        res = supabase.table("support_messages").select("*").eq("user_id", uid).order("created_at").limit(50).execute()
+        return jsonify(res.data or [])
+    except: return jsonify([])
+
+@app.route('/verify/<user_id>')
+def verify_api(user_id):
+    ok, tx, amt = check_payment(user_id)
+    if ok:
+        exp = datetime.now() + timedelta(days=30)
+        user=get_user(user_id)
+        if not user: user={"user_id":user_id}
+        user["expires_at"]=exp.strftime("%Y-%m-%d %H:%M:%S"); user["status"]="active"; save_user(user)
+        try: supabase.table("subscriptions").upsert({"user_id":user_id,"expire_at":exp.isoformat(),"is_paid":True,"tx_hash":tx,"amount_paid":amt}).execute()
+        except: pass
+        return jsonify({"paid":True})
+    return jsonify({"paid":False,"amount":amt})
+
+@app.route('/check', methods=['GET'])
+def check():
+    user_id = request.args.get('user_id')
+    if not user_id: return jsonify({"error": "user_id missing"}), 400
+    now = datetime.now(); user = get_user(user_id)
+    base_url = request.host_url
+    links = [f"{base_url}download/{f}?user_id={user_id}" for f in FILES]
+    if not user:
+        restored = restore_paid_user(user_id)
+        if restored:
+            user = restored
+            return jsonify({"status": "active", "links": links, "files": FILES, "hours": format_hm(get_remaining_hours(user))})
+        expires = now + timedelta(hours=2)
+        user = {"user_id": user_id, "expires_at": expires.strftime("%Y-%m-%d %H:%M:%S"), "status": "active"}
+        save_user(user)
+        return jsonify({"status": "active", "links": links, "files": FILES, "hours": "2:00:00"})
+    sub = get_active_subscription(user_id)
+    if sub:
+        exp = parse_expire(sub.get("expire_at"))
+        if exp and exp > now:
+            user["expires_at"] = exp.strftime("%Y-%m-%d %H:%M:%S"); user["status"]="active"; save_user(user)
+            return jsonify({"status": "active", "links": links, "files": FILES, "hours": format_hm(get_remaining_hours(user))})
+    if user.get("status")=="inactive":
+        return jsonify({"status": "disabled", "message": "تم تعطيل حسابك", "hours": "معطل", "files": FILES})
+    remaining = get_remaining_hours(user)
+    if remaining <= 0:
+        last_expire = parse_expire(user["expires_at"])
+        if not last_expire: last_expire = now
+        hours_since_expire = (now - last_expire).total_seconds() / 3600
+        if hours_since_expire >= 24:
+            new_expire = now + timedelta(hours=2)
+            user["expires_at"] = new_expire.strftime("%Y-%m-%d %H:%M:%S"); user["status"]="active"; save_user(user)
+            return jsonify({"status": "active", "links": links, "files": FILES, "hours": "2:00:00"})
+        else:
+            remaining_cooldown = 24 - hours_since_expire
+            return jsonify({"status": "cooldown", "message": f"انتهى - انتظر {format_hm(remaining_cooldown)} او ادفع", "hours": format_hm(remaining_cooldown), "files": FILES})
+    return jsonify({"status": "active", "links": links, "files": FILES, "hours": format_hm(remaining)})
+
+@app.route('/download/<filename>')
+def download(filename):
+    user_id = request.args.get('user_id')
+    if not user_id: return "user_id missing", 400
+    user = get_user(user_id)
+    if not user:
+        restored = restore_paid_user(user_id)
+        if restored: user = restored
+        else: return redirect(f"/pay/{user_id}")
+    if user.get("status")=="inactive": return Response("معطل", 403)
+    if get_remaining_hours(user) <= 0: return redirect(f"/pay/{user_id}")
+    if filename not in FILES: return "not allowed", 403
+    try:
+        github_url = f"{GITHUB_RAW_BASE}/{filename}"
+        r = requests.get(github_url, stream=True, timeout=30)
+        if r.status_code != 200:
+            return f"File {filename} not found", 404
+        return Response(r.iter_content(chunk_size=8192), mimetype='application/octet-stream', headers={"Content-Disposition": f"attachment;filename={filename}"})
+    except Exception as e:
+        return f"GitHub fetch error: {str(e)}", 500
+
+# ===== ADMIN - كله مصلح =====
+@app.route("/admin")
+def admin():
+    if request.args.get("key") not in ALLOWED_KEYS: return Response(f"<h1>401 - غير مصرح</h1><p>افتح بهذا الشكل: /admin?key={ADMIN_KEY}</p>",401)
+    return Response(ADMIN_HTML, mimetype='text/html')
+
+@app.route("/admin/users")
+def a_users():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"key غلط","hint":f"استخدم ?key={ADMIN_KEY}"}),401
+    try: users = supabase.table("users").select("*").order("expires_at",desc=True).limit(200).execute().data
+    except Exception as e: return jsonify({"error": str(e)}),500
+    try: paid_ids = {x["user_id"] for x in get_paid_users_list() if x["is_active"]}
+    except: paid_ids = set()
+    out=[]
+    for u in users:
+        if u["user_id"] in paid_ids: continue
+        raw_status=u.get("status","active")
+        rem_hours = get_remaining_hours(u)
+        is_active = raw_status!="inactive" and rem_hours>0
+        formatted = format_hm(rem_hours) if raw_status!="inactive" else "معطل"
+        out.append({"user_id":u["user_id"],"expire_at":u["expires_at"],"remaining": rem_hours,"remaining_formatted": formatted,"raw_status": raw_status,"is_active": is_active,"is_paid": False,"ip_address": u.get("ip_address","")})
+    return jsonify(out)
+
+@app.route("/admin/paid")
+def admin_paid():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    return jsonify(get_paid_users_list())
+
+@app.route("/admin/usdt")
+def admin_usdt():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    all_paid = get_paid_users_list()
+    usdt_only = [x for x in all_paid if x["method"]=="USDT"]
+    return jsonify(usdt_only)
+
+@app.route("/admin/paid-extend", methods=['POST'])
+def admin_paid_extend():
+    if request.args.get("key") not in ALLOWED_KEYS:
+        return jsonify({"message": "key غلط"}), 401
+    data = request.get_json(silent=True) or {}
+    uid = data.get("user_id")
+    if not uid:
+        return jsonify({"message": "user_id ناقص"}), 400
+    try:
+        subs = supabase.table("subscriptions").select("*").eq("user_id", uid).eq("is_paid", True).execute().data or []
+        if not subs:
+            return jsonify({"message": "ماعنداش اشتراك - ديرله اشتراك جديد"}), 404
+        best = max(subs, key=lambda s: parse_expire(s.get("expire_at") or "2000-01-01") or datetime(2000, 1, 1))
+        old_exp = parse_expire(best.get("expire_at")) or datetime.now()
+        base = max(old_exp, datetime.now())
+        new_exp = base + timedelta(days=30)
+        if best.get("id"):
+            supabase.table("subscriptions").update({"expire_at": new_exp.isoformat()}).eq("id", best.get("id")).execute()
+        else:
+            supabase.table("subscriptions").update({"expire_at": new_exp.isoformat()}).eq("user_id", uid).eq("tx_hash", best.get("tx_hash")).execute()
+        user = get_user(uid)
+        if user:
+            user["expires_at"] = new_exp.strftime("%Y-%m-%d %H:%M:%S")
+            user["status"] = "active"
+            save_user(user)
+        return jsonify({"message": f"تم تمديد {uid} 30 يوم - ينتهي {new_exp.strftime('%Y-%m-%d %H:%M:%S')}"})
+    except Exception as e:
+        return jsonify({"message": f"خطأ: {e}"}), 500
+
+@app.route("/admin/paid-delete", methods=['POST'])
+def admin_paid_delete():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    uid = (request.get_json(silent=True) or {}).get("user_id")
+    try:
+        supabase.table("subscriptions").delete().eq("user_id", uid).execute()
+        supabase.table("users").delete().eq("user_id", uid).execute()
+        try: supabase.table("madar_cards_used").delete().eq("user_id", uid).execute()
+        except: pass
+        try: supabase.table("madar_pending").delete().eq("user_id", uid).execute()
+        except: pass
+        return jsonify({"message": f"تم حذف اشتراك {uid} نهائيا"})
+    except Exception as e: return jsonify({"message": str(e)}),500
+
+@app.route("/admin/action", methods=['POST'])
+def admin_action():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    data = request.get_json(silent=True) or {}; uid=data.get("user_id"); act=data.get("action"); days=data.get("days",0); hours=data.get("hours",0)
+    try:
+        if is_paid_user(uid) and act in ["delete","disable","enable","add_days"]:
+            return jsonify({"message":"هذا مشترك مدفوع - عدله من تب المشتركين / USDT"}),400
+        user = get_user(uid)
+        if not user and act!="delete": return jsonify({"message":"اليوزر غير موجود"}),404
+        if act=="delete":
+            supabase.table("users").delete().eq("user_id", uid).execute()
+            return jsonify({"message":f"تم حذف المجاني {uid}"})
+        elif act=="disable":
+            supabase.table("users").update({"status":"inactive"}).eq("user_id", uid).execute()
+            return jsonify({"message":f"تم تعطيل {uid}"})
+        elif act=="enable":
+            supabase.table("users").update({"status":"active"}).eq("user_id", uid).execute()
+            return jsonify({"message":f"تم تفعيل {uid}"})
+        elif act=="extend_custom" or act=="add_days":
+            current_exp = parse_expire(user.get("expires_at")) if user else datetime.now()
+            if not current_exp or current_exp < datetime.now(): current_exp = datetime.now()
+            new_exp = current_exp + timedelta(days=int(days), hours=int(hours))
+            if new_exp < datetime.now(): new_exp = datetime.now() + timedelta(hours=1)
+            supabase.table("users").update({"expires_at": new_exp.strftime("%Y-%m-%d %H:%M:%S"),"status":"active"}).eq("user_id", uid).execute()
+            diff = new_exp - datetime.now(); d = diff.days; h = diff.seconds//3600
+            return jsonify({"message":f"تم التحديث متبقي الآن: {d} يوم و {h} ساعة"})
+    except Exception as e: return jsonify({"message": f"خطأ: {str(e)}"}), 500
+    return jsonify({"message":"unknown"})
+
+@app.route("/admin/support")
+def admin_support():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    try:
+        res = supabase.table("support_messages").select("*").order("created_at", desc=True).limit(200).execute()
+        return jsonify(res.data or [])
+    except: return jsonify([])
+
+@app.route("/admin/devices")
+def admin_devices():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    try:
+        res = supabase.table("device_limits").select("*").execute()
+        return jsonify(res.data or [])
+    except: return jsonify([])
+
+@app.route("/admin/devices/delete", methods=['POST'])
+def admin_devices_delete():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    data = request.get_json(silent=True) or {}
+    try: supabase.table("device_limits").delete().eq("fingerprint", data.get("fingerprint")).execute()
+    except: pass
+    return jsonify({"message":"تم"})
+
+@app.route("/admin/devices/clear", methods=['POST'])
+def admin_devices_clear():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    try: supabase.table("device_limits").delete().neq("fingerprint", "___none___").execute()
+    except: pass
+    return jsonify({"message":"تم المسح"})
+
+@app.route("/admin/madar-pending")
+def admin_madar_pending():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    try:
+        res = supabase.table("madar_pending").select("*").order("created_at", desc=True).limit(200).execute()
+        return jsonify(res.data or [])
+    except: return jsonify([])
+
+@app.route("/admin/madar-approve", methods=['POST'])
+def admin_madar_approve():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    data = request.get_json(silent=True) or {}
+    pid = data.get("id"); uid = data.get("user_id"); card = data.get("card_code","")
+    try:
+        supabase.table("madar_pending").update({"status": "approved"}).eq("id", pid).execute()
+        try: supabase.table("madar_cards_used").insert({"user_id": uid, "card_code": card}).execute()
+        except: pass
+        madar_activate(uid)
+        return jsonify({"message": f"تم تفعيل {uid} - 30 يوم"})
+    except Exception as e:
+        return jsonify({"message": f"خطأ: {e}"}),500
+
+@app.route("/admin/madar-reject", methods=['POST'])
+def admin_madar_reject():
+    if request.args.get("key") not in ALLOWED_KEYS: return jsonify({"error":"no"}),401
+    pid = (request.get_json(silent=True) or {}).get("id")
+    try:
+        supabase.table("madar_pending").update({"status": "rejected"}).eq("id", pid).execute()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}),500
+
+@app.route('/api/madar/charge-card', methods=['POST'])
+def madar_charge_card():
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    card_code = str(data.get("card_code","")).strip().replace(" ","").replace("-","")
+    if not card_code or len(str(card_code)) < 10:
+        return jsonify({"status":"fail"})
+    try:
+        used = supabase.table("madar_cards_used").select("*").eq("card_code", card_code).execute()
+        if used.data:
+            return jsonify({"status":"used"})
+        pending = supabase.table("madar_pending").select("*").eq("card_code", card_code).eq("status","pending").execute()
+        if pending.data:
+            return jsonify({"status":"used"})
+    except: pass
+    try:
+        supabase.table("madar_pending").insert({"user_id": user_id, "card_code": card_code, "status": "pending"}).execute()
+    except Exception as e:
+        return jsonify({"status":"fail", "error": str(e)})
+    return jsonify({"status":"pending"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
