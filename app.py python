@@ -223,7 +223,7 @@ CONTENT_HTML = """<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="
 <script>
 const UID="__UID__";
 const SOCIAL_FILE="SOCIAL⚡🌐 .npvs";
-const SOCIAL_ID="1RIsYnL-EJfUmaSdNTIYcSYEZpA708zTy";
+const SOCIAL_ID="1Tpil0nFJVastyCET2xnmpn9Pu3--xMSc";
 const SOCIAL_URL="https://drive.usercontent.google.com/download?id="+SOCIAL_ID+"&export=download&authuser=0&confirm=t";
 function isSocial(f){ return f===SOCIAL_FILE; }
 function getDownloadUrl(f){ if(isSocial(f)) return SOCIAL_URL; return '/download/'+encodeURIComponent(f)+'?user_id='+UID; }
